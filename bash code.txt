@@ -1,0 +1,478 @@
+#!/bin/bash
+
+DEFAULT_OUTPUT_JSON="amfi_nav_data.json"
+DEFAULT_OUTPUT_TSV="amfi_nav_data.tsv"
+TEMP_FILE="nav_temp.txt"
+URL="https://portal.amfiindia.com/spages/NAVAll.txt"
+
+show_usage() {
+    cat << EOF
+Usage: $0 [OPTIONS] [OUTPUT_FILE]
+
+OPTIONS:
+    -f, --format FORMAT     Output format: json, tsv, or both (default: json)
+    -o, --output PREFIX     Output file prefix (for -f both) or filename
+    -h, --help             Show this help message
+    -v, --validate         Validate JSON output (requires jq)
+    --preview N            Show first N records after extraction (default: 3)
+
+ARGUMENTS:
+    OUTPUT_FILE            Output filename (optional, uses format-specific default)
+
+EXAMPLES:
+    $0                                    # JSON with default name
+    $0 -f tsv                            # TSV format
+    $0 -f both -o nav_\$(date +%Y%m%d)   # Both formats with prefix
+    $0 --validate --preview 5            # JSON with validation and 5 records preview
+
+EOF
+}
+
+FORMAT="json"
+VALIDATE=false
+PREVIEW_COUNT=3
+OUTPUT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -f|--format)
+            FORMAT="$2"
+            shift 2
+            ;;
+        -o|--output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        -v|--validate)
+            VALIDATE=true
+            shift
+            ;;
+        --preview)
+            PREVIEW_COUNT="$2"
+            shift 2
+            ;;
+        -*)
+            echo "Error: Unknown option $1" >&2
+            show_usage
+            exit 1
+            ;;
+        *)
+            if [[ -z "$OUTPUT_FILE" ]]; then
+                OUTPUT_FILE="$1"
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ ! "$FORMAT" =~ ^(json|tsv|both)$ ]]; then
+    echo "Error: Format must be 'json', 'tsv', or 'both'" >&2
+    exit 1
+fi
+
+if [[ -n "$OUTPUT_FILE" ]]; then
+    if [[ "$FORMAT" == "both" ]]; then
+        OUTPUT_JSON="${OUTPUT_FILE}.json"
+        OUTPUT_TSV="${OUTPUT_FILE}.tsv"
+    elif [[ "$FORMAT" == "json" ]]; then
+        OUTPUT_JSON="$OUTPUT_FILE"
+    else
+        OUTPUT_TSV="$OUTPUT_FILE"
+    fi
+else
+    OUTPUT_JSON="$DEFAULT_OUTPUT_JSON"
+    OUTPUT_TSV="$DEFAULT_OUTPUT_TSV"
+fi
+
+extract_json() {
+    local output_file="$1"
+    echo "Processing data to JSON format: $output_file"
+    local total_records=$(awk -F';' '
+        NR > 1 && NF == 6 && $4 != "" && $5 != "" && $4 != "Scheme Name" && $5 ~ /^[0-9]+(\.[0-9]*)?$/ {
+            gsub(/^[ \t]+|[ \t]+$/, "", $1)
+            gsub(/^[ \t]+|[ \t]+$/, "", $4)
+            gsub(/^[ \t]+|[ \t]+$/, "", $5)
+            gsub(/^[ \t]+|[ \t]+$/, "", $6)
+            if ($1 != "" && $4 != "" && $5 != "" && $6 != "") count++
+        }
+        END { print count+0 }
+    ' "$TEMP_FILE")
+    {
+        echo '{'
+        echo '  "metadata": {'
+        echo "    \"extracted_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+        echo '    "source": "https://portal.amfiindia.com/spages/NAVAll.txt",'
+        echo "    \"total_records\": $total_records"
+        echo '  },'
+        echo '  "schemes": ['
+        awk -F';' '
+        BEGIN {
+            first_record = 1
+            record_count = 0
+        }
+        NR > 1 && NF == 6 && $4 != "" && $5 != "" && $4 != "Scheme Name" && $5 ~ /^[0-9]+(\.[0-9]*)?$/ {
+            gsub(/^[ \t]+|[ \t]+$/, "", $1)
+            gsub(/^[ \t]+|[ \t]+$/, "", $4)
+            gsub(/^[ \t]+|[ \t]+$/, "", $5)
+            gsub(/^[ \t]+|[ \t]+$/, "", $6)
+            if ($1 == "" || $4 == "" || $5 == "" || $6 == "") next
+            gsub(/\\/, "\\\\", $4)
+            gsub(/"/, "\\\"", $4)
+            gsub(/\n/, "\\n", $4)
+            gsub(/\r/, "\\r", $4)
+            gsub(/\t/, "\\t", $4)
+            gsub(/^[ \t]+|[ \t]+$/, "", $6)
+            gsub(/"/, "", $6)
+            gsub(/\n/, "", $6)
+            gsub(/\r/, "", $6)
+            if (!first_record) printf ",\n"
+            printf "    {\n"
+            printf "      \"scheme_code\": \"%s\",\n", $1
+            printf "      \"scheme_name\": \"%s\",\n", $4
+            printf "      \"nav\": %s,\n", $5
+            printf "      \"date\": \"%s\"\n", $6
+            printf "    }"
+            first_record = 0
+            record_count++
+        }
+        END {
+            if (!first_record) printf "\n"
+        }' "$TEMP_FILE"
+        echo '  ]'
+        echo '}'
+    } > "$output_file"
+    RECORD_COUNT=$total_records
+    echo "JSON extraction complete! Records processed: $RECORD_COUNT"
+}
+
+extract_tsv() {
+    local output_file="$1"
+    echo "Processing data to TSV format: $output_file"
+    echo -e "Scheme_Code\tScheme_Name\tNAV\tDate" > "$output_file"
+    awk -F';' 'BEGIN { OFS="\t" }
+    NR > 1 && NF == 6 && $4 != "" && $5 != "" && $4 != "Scheme Name" && $5 ~ /^[0-9]+(\.[0-9]*)?$/ {
+        gsub(/^[ \t]+|[ \t]+$/, "", $1)
+        gsub(/^[ \t]+|[ \t]+$/, "", $4)
+        gsub(/^[ \t]+|[ \t]+$/, "", $5)
+        gsub(/^[ \t]+|[ \t]+$/, "", $6)
+        if ($1 == "" || $4 == "" || $5 == "" || $6 == "") next
+        print $1, $4, $5, $6
+    }' "$TEMP_FILE" >> "$output_file"
+    RECORD_COUNT=$(tail -n +2 "$output_file" | wc -l)
+    echo "TSV extraction complete! Records processed: $RECORD_COUNT"
+}
+
+echo "Downloading AMFI NAV data from $URL..."
+if ! curl -s --connect-timeout 30 --max-time 60 "$URL" -o "$TEMP_FILE"; then
+    echo "Error: Failed to download data from $URL" >&2
+    echo "Please check your internet connection and try again." >&2
+    exit 1
+fi
+
+if [[ ! -s "$TEMP_FILE" ]]; then
+    echo "Error: Downloaded file is empty" >&2
+    exit 1
+fi
+
+echo "Download completed successfully!"
+
+case "$FORMAT" in
+    "json")
+        extract_json "$OUTPUT_JSON"
+        MAIN_OUTPUT="$OUTPUT_JSON"
+        ;;
+    "tsv")
+        extract_tsv "$OUTPUT_TSV"
+        MAIN_OUTPUT="$OUTPUT_TSV"
+        ;;
+    "both")
+        extract_json "$OUTPUT_JSON"
+        extract_tsv "$OUTPUT_TSV"
+        MAIN_OUTPUT="$OUTPUT_JSON and $OUTPUT_TSV"
+        ;;
+esac
+
+rm -f "$TEMP_FILE"
+
+echo ""
+echo "✅ Extraction completed successfully!"
+echo "📁 Output saved to: $MAIN_OUTPUT"
+
+if [[ "$FORMAT" =~ ^(json|both)$ ]] && [[ "$VALIDATE" == true ]]; then
+    echo ""
+    if command -v jq >/dev/null 2>&1; then
+        echo "🔍 Validating JSON..."
+        if jq empty "$OUTPUT_JSON" 2>/dev/null; then
+            echo "✅ JSON is valid!"
+        else
+            echo "❌ JSON validation failed!"
+            echo "Debug: Checking JSON structure..."
+            tail -5 "$OUTPUT_JSON"
+        fi
+    else
+        echo "⚠️  jq not found. Install with: sudo apt install jq"
+    fi
+fi
+
+if [[ "$PREVIEW_COUNT" -gt 0 ]]; then
+    echo ""
+    echo "📋 Sample data (first $PREVIEW_COUNT records):"
+    if [[ "$FORMAT" =~ ^(json|both)$ ]]; then
+        echo ""
+        echo "JSON format:"
+        if command -v jq >/dev/null 2>&1; then
+            if jq ".schemes[:$PREVIEW_COUNT]" "$OUTPUT_JSON" 2>/dev/null; then
+                :
+            else
+                echo "⚠️  jq preview failed, showing raw sample:"
+                grep -A 15 '"schemes": \[' "$OUTPUT_JSON" | head -20
+            fi
+        else
+            echo "⚠️  jq not available, showing raw sample:"
+            grep -A 15 '"schemes": \[' "$OUTPUT_JSON" | head -20
+        fi
+    fi
+    if [[ "$FORMAT" =~ ^(tsv|both)$ ]]; then
+        if [[ "$FORMAT" == "both" ]]; then
+            echo ""
+        fi
+        echo "TSV format:"
+        if command -v column >/dev/null 2>&1; then
+            head -$((PREVIEW_COUNT + 1)) "$OUTPUT_TSV" | column -t -s $'\t' 2>/dev/null || head -$((PREVIEW_COUNT + 1)) "$OUTPUT_TSV"
+        else
+            head -$((PREVIEW_COUNT + 1)) "$OUTPUT_TSV"
+        fi
+    fi
+fi
+
+echo ""
+echo "📊 Summary:"
+echo "  Total records processed: $RECORD_COUNT"
+if [[ -f "$OUTPUT_JSON" ]]; then
+    echo "  JSON file size: $(du -h "$OUTPUT_JSON" | cut -f1)"
+fi
+if [[ -f "$OUTPUT_TSV" ]]; then
+    echo "  TSV file size: $(du -h "$OUTPUT_TSV" | cut -f1)"
+fi
+
+echo ""
+echo "🔧 Useful commands:"
+if [[ "$FORMAT" =~ ^(json|both)$ ]]; then
+    echo "  Validate JSON: jq empty '$OUTPUT_JSON' && echo 'Valid JSON'"
+    echo "  Count records: jq '.metadata.total_records' '$OUTPUT_JSON'"
+    echo "  Search schemes: jq '.schemes[] | select(.scheme_name | contains(\"SBI\"))' '$OUTPUT_JSON'"
+    echo "  Pretty print: jq '.' '$OUTPUT_JSON' | less"
+fi
+if [[ "$FORMAT" =~ ^(tsv|both)$ ]]; then
+    echo "  View in columns: column -t -s \$'\\t' '$OUTPUT_TSV' | less"
+    echo "  Count records: tail -n +2 '$OUTPUT_TSV' | wc -l"
+    echo "  Search schemes: grep -i 'SBI' '$OUTPUT_TSV'"
+    echo "  Sort by NAV: sort -t\$'\\t' -k3 -n '$OUTPUT_TSV'"
+fi
+
+echo ""
+echo "🎉 Script execution completed successfully!"
+
+
+
+
+
+
+
+
+
+Output
+./script_name.sh                                    
+./script_name.sh -f tsv                             
+./script_name.sh -f both -o nav_$(date +%Y%m%d)     
+./script_name.sh --validate --preview 5
+Downloading AMFI NAV data from https://portal.amfiindia.com/spages/NAVAll.txt...
+Download completed successfully!
+Processing data to JSON format: amfi_nav_data.json
+JSON extraction complete! Records processed: 14024
+
+✅ Extraction completed successfully!
+📁 Output saved to: amfi_nav_data.json
+
+📋 Sample data (first 3 records):
+
+JSON format:
+[
+  {
+    "scheme_code": "119551",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - IDCW",
+    "nav": 108.4428,
+    "date": "19-Sep-2025"
+  },
+  {
+    "scheme_code": "119552",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - MONTHLY IDCW",
+    "nav": 117.2755,
+    "date": "19-Sep-2025"
+  },
+  {
+    "scheme_code": "119553",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - Direct - Quarterly IDCW",
+    "nav": 104.0246,
+    "date": "19-Sep-2025"
+  }
+]
+
+📊 Summary:
+  Total records processed: 14024
+  JSON file size: 2.5M
+  TSV file size: 1.3M
+
+🔧 Useful commands:
+  Validate JSON: jq empty 'amfi_nav_data.json' && echo 'Valid JSON'
+  Count records: jq '.metadata.total_records' 'amfi_nav_data.json'
+  Search schemes: jq '.schemes[] | select(.scheme_name | contains("SBI"))' 'amfi_nav_data.json'
+  Pretty print: jq '.' 'amfi_nav_data.json' | less
+
+🎉 Script execution completed successfully!
+Downloading AMFI NAV data from https://portal.amfiindia.com/spages/NAVAll.txt...
+Download completed successfully!
+Processing data to TSV format: amfi_nav_data.tsv
+TSV extraction complete! Records processed: 14024
+
+✅ Extraction completed successfully!
+📁 Output saved to: amfi_nav_data.tsv
+
+📋 Sample data (first 3 records):
+TSV format:
+Scheme_Code  Scheme_Name                                                               NAV       Date
+119551       Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - IDCW            108.4428  19-Sep-2025
+119552       Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - MONTHLY IDCW    117.2755  19-Sep-2025
+119553       Aditya Birla Sun Life Banking & PSU Debt Fund  - Direct - Quarterly IDCW  104.0246  19-Sep-2025
+
+📊 Summary:
+  Total records processed: 14024
+  JSON file size: 2.5M
+  TSV file size: 1.3M
+
+🔧 Useful commands:
+  View in columns: column -t -s $'\t' 'amfi_nav_data.tsv' | less
+  Count records: tail -n +2 'amfi_nav_data.tsv' | wc -l
+  Search schemes: grep -i 'SBI' 'amfi_nav_data.tsv'
+  Sort by NAV: sort -t$'\t' -k3 -n 'amfi_nav_data.tsv'
+
+🎉 Script execution completed successfully!
+Downloading AMFI NAV data from https://portal.amfiindia.com/spages/NAVAll.txt...
+Download completed successfully!
+Processing data to JSON format: nav_20250922.json
+JSON extraction complete! Records processed: 14024
+Processing data to TSV format: nav_20250922.tsv
+TSV extraction complete! Records processed: 14024
+
+✅ Extraction completed successfully!
+📁 Output saved to: nav_20250922.json and nav_20250922.tsv
+
+📋 Sample data (first 3 records):
+
+JSON format:
+[
+  {
+    "scheme_code": "119551",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - IDCW",
+    "nav": 108.4428,
+    "date": "19-Sep-2025"
+  },
+  {
+    "scheme_code": "119552",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - MONTHLY IDCW",
+    "nav": 117.2755,
+    "date": "19-Sep-2025"
+  },
+  {
+    "scheme_code": "119553",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - Direct - Quarterly IDCW",
+    "nav": 104.0246,
+    "date": "19-Sep-2025"
+  }
+]
+
+TSV format:
+Scheme_Code  Scheme_Name                                                               NAV       Date
+119551       Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - IDCW            108.4428  19-Sep-2025
+119552       Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - MONTHLY IDCW    117.2755  19-Sep-2025
+119553       Aditya Birla Sun Life Banking & PSU Debt Fund  - Direct - Quarterly IDCW  104.0246  19-Sep-2025
+
+📊 Summary:
+  Total records processed: 14024
+  JSON file size: 2.5M
+  TSV file size: 1.3M
+
+🔧 Useful commands:
+  Validate JSON: jq empty 'nav_20250922.json' && echo 'Valid JSON'
+  Count records: jq '.metadata.total_records' 'nav_20250922.json'
+  Search schemes: jq '.schemes[] | select(.scheme_name | contains("SBI"))' 'nav_20250922.json'
+  Pretty print: jq '.' 'nav_20250922.json' | less
+  View in columns: column -t -s $'\t' 'nav_20250922.tsv' | less
+  Count records: tail -n +2 'nav_20250922.tsv' | wc -l
+  Search schemes: grep -i 'SBI' 'nav_20250922.tsv'
+  Sort by NAV: sort -t$'\t' -k3 -n 'nav_20250922.tsv'
+
+🎉 Script execution completed successfully!
+Downloading AMFI NAV data from https://portal.amfiindia.com/spages/NAVAll.txt...
+Download completed successfully!
+Processing data to JSON format: amfi_nav_data.json
+JSON extraction complete! Records processed: 14024
+
+✅ Extraction completed successfully!
+📁 Output saved to: amfi_nav_data.json
+
+🔍 Validating JSON...
+✅ JSON is valid!
+
+📋 Sample data (first 5 records):
+
+JSON format:
+[
+  {
+    "scheme_code": "119551",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - IDCW",
+    "nav": 108.4428,
+    "date": "19-Sep-2025"
+  },
+  {
+    "scheme_code": "119552",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - DIRECT - MONTHLY IDCW",
+    "nav": 117.2755,
+    "date": "19-Sep-2025"
+  },
+  {
+    "scheme_code": "119553",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - Direct - Quarterly IDCW",
+    "nav": 104.0246,
+    "date": "19-Sep-2025"
+  },
+  {
+    "scheme_code": "108272",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - REGULAR - IDCW",
+    "nav": 152.214,
+    "date": "19-Sep-2025"
+  },
+  {
+    "scheme_code": "110282",
+    "scheme_name": "Aditya Birla Sun Life Banking & PSU Debt Fund  - REGULAR - MONTHLY IDCW",
+    "nav": 112.9827,
+    "date": "19-Sep-2025"
+  }
+]
+
+📊 Summary:
+  Total records processed: 14024
+  JSON file size: 2.5M
+  TSV file size: 1.3M
+
+🔧 Useful commands:
+  Validate JSON: jq empty 'amfi_nav_data.json' && echo 'Valid JSON'
+  Count records: jq '.metadata.total_records' 'amfi_nav_data.json'
+  Search schemes: jq '.schemes[] | select(.scheme_name | contains("SBI"))' 'amfi_nav_data.json'
+  Pretty print: jq '.' 'amfi_nav_data.json' | less
+
+🎉 Script execution completed successfully!
